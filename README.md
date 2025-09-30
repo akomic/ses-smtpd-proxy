@@ -65,6 +65,20 @@ expected by Go's http.Server. A sample response:
 { "name": "ses-smtp-proxy", "status": "ok", "version": "v1.3.0" }
 ```
 
+## Cross-Account Role Assumption
+The server supports assuming a cross-account IAM role for SES access. This is
+useful when running in environments like AWS EKS where the pod's IRSA role is
+in one account but SES is in another account.
+
+To enable cross-account role assumption, use the `--cross-account-role` flag:
+
+```
+./ses-smtpd-proxy --cross-account-role=arn:aws:iam::123456789012:role/SESCrossAccountRole
+```
+
+The cross-account role must have SES permissions and trust the role used by
+the proxy (e.g., IRSA role in EKS).
+
 ## Usage
 By default the command takes no arguments and will listen on port 2500 on all
 interfaces. The listen interfaces and port can be specified as the only

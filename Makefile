@@ -1,6 +1,6 @@
 BINARY ?= ses-smtpd-proxy
-DOCKER_REGISTRY ?= docker.crute.me
-DOCKER_IMAGE_NAME ?= ses-email-proxy
+DOCKER_REGISTRY ?= ak78
+DOCKER_IMAGE_NAME ?= ses-smtpd-proxy
 DOCKER_TAG ?= latest
 DOCKER_IMAGE ?= ${DOCKER_REGISTRY}/${DOCKER_IMAGE_NAME}:${DOCKER_TAG}
 VERSION ?= $(shell git describe --long --tags --dirty --always)
@@ -16,6 +16,10 @@ go.sum: go.mod
 .PHONY: docker
 docker:
 	docker build --build-arg VERSION=$(VERSION) -t $(DOCKER_IMAGE) .
+
+.PHONY: docker-amd64
+docker-amd64:
+	docker build --platform linux/amd64 --build-arg VERSION=$(VERSION) -t $(DOCKER_IMAGE) .
 
 .PHONY: publish
 publish: docker

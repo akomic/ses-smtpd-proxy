@@ -15,8 +15,10 @@ import (
 	"code.crute.us/mcrute/ses-smtpd-proxy/vault"
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/credentials"
+	"github.com/aws/aws-sdk-go/aws/credentials/stscreds"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/ses"
+	"github.com/aws/aws-sdk-go/service/sts"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -106,7 +108,7 @@ func (e *Envelope) Close() error {
 	return err
 }
 
-func makeSesClient(ctx context.Context, enableVault bool, vaultPath string, credentialError chan<- error) (*ses.SES, error) {
+func makeSesClient(ctx context.Context, enableVault bool, vaultPath string, crossAccountRole string, credentialError chan<- error) (*ses.SES, error) {
 	var err error
 	var s *session.Session
 
@@ -126,6 +128,28 @@ func makeSesClient(ctx context.Context, enableVault bool, vaultPath string, cred
 		return nil, err
 	}
 
+	// If cross-account role is specified, assume it
+	if crossAccountRole != "" {
+		log.Printf("Assuming cross-account role: %s", crossAccountRole)
+		creds := stscreds.NewCredentials(s, crossAccountRole)
+		s, err = session.NewSession(&aws.Config{
+			Credentials: creds,
+		})
+		if err != nil {
+			return nil, err
+		}
+		log.Printf("Successfully assumed cross-account role")
+		
+		// Verify the assumed identity
+		stsClient := sts.New(s)
+		identity, err := stsClient.GetCallerIdentity(&sts.GetCallerIdentityInput{})
+		if err != nil {
+			log.Printf("Warning: Could not verify assumed identity: %v", err)
+		} else {
+			log.Printf("Current identity - Account: %s, ARN: %s", *identity.Account, *identity.Arn)
+		}
+	}
+
 	return ses.New(s), nil
 }
 
@@ -141,6 +165,7 @@ func main() {
 	vaultPath := flag.String("vault-path", "", "Full path to Vault credential (ex: \"aws/creds/my-mail-user\")")
 	showVersion := flag.Bool("version", false, "Show program version")
 	configurationSetName := flag.String("configuration-set-name", "", "Configuration set name with which SendRawEmail will be invoked")
+	crossAccountRole := flag.String("cross-account-role", "", "ARN of cross-account role to assume for SES access")
 	enableHealthCheck := flag.Bool("enable-health-check", false, "Enable health check server")
 	healthCheckBind := flag.String("health-check-bind", ":3000", "Address/port on which to bind health check server")
 
@@ -162,7 +187,7 @@ func main() {
 	}
 
 	credentialError := make(chan error, 2)
-	sesClient, err := makeSesClient(ctx, *enableVault, *vaultPath, credentialError)
+	sesClient, err := makeSesClient(ctx, *enableVault, *vaultPath, *crossAccountRole, credentialError)
 	if err != nil {
 		log.Fatalf("Error creating AWS session: %s", err)
 	}
