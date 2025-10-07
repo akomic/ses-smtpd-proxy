@@ -13,12 +13,13 @@ import (
 
 	"code.crute.us/mcrute/ses-smtpd-proxy/smtpd"
 	"code.crute.us/mcrute/ses-smtpd-proxy/vault"
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/credentials"
-	"github.com/aws/aws-sdk-go/aws/credentials/stscreds"
-	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/service/ses"
-	"github.com/aws/aws-sdk-go/service/sts"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/credentials/stscreds"
+	"github.com/aws/aws-sdk-go-v2/service/ses"
+	"github.com/aws/aws-sdk-go-v2/service/ses/types"
+	"github.com/aws/aws-sdk-go-v2/service/sts"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -51,7 +52,7 @@ var (
 
 type Envelope struct {
 	from          string
-	client        *ses.SES
+	client        *ses.Client
 	configSetName *string
 	rcpts         []*string
 	b             bytes.Buffer
@@ -91,13 +92,19 @@ func (e *Envelope) logMessageSend() {
 }
 
 func (e *Envelope) Close() error {
+	// Convert []*string to []string for SDK v2
+	destinations := make([]string, len(e.rcpts))
+	for i, rcpt := range e.rcpts {
+		destinations[i] = *rcpt
+	}
+
 	r := &ses.SendRawEmailInput{
 		ConfigurationSetName: e.configSetName,
 		Source:               &e.from,
-		Destinations:         e.rcpts,
-		RawMessage:           &ses.RawMessage{Data: e.b.Bytes()},
+		Destinations:         destinations,
+		RawMessage:           &types.RawMessage{Data: e.b.Bytes()},
 	}
-	_, err := e.client.SendRawEmail(r)
+	_, err := e.client.SendRawEmail(context.TODO(), r)
 	if err != nil {
 		log.Printf("ERROR: ses: %v", err)
 		emailError.With(prometheus.Labels{"type": "ses error"}).Inc()
@@ -108,9 +115,9 @@ func (e *Envelope) Close() error {
 	return err
 }
 
-func makeSesClient(ctx context.Context, enableVault bool, vaultPath string, crossAccountRole string, credentialError chan<- error) (*ses.SES, error) {
+func makeSesClient(ctx context.Context, enableVault bool, vaultPath string, crossAccountRole string, credentialError chan<- error) (*ses.Client, error) {
+	var cfg aws.Config
 	var err error
-	var s *session.Session
 
 	if enableVault {
 		cred, err := vault.GetVaultSecret(ctx, vaultPath, credentialError)
@@ -118,11 +125,15 @@ func makeSesClient(ctx context.Context, enableVault bool, vaultPath string, cros
 			return nil, err
 		}
 
-		s, err = session.NewSession(&aws.Config{
-			Credentials: credentials.NewStaticCredentialsFromCreds(cred),
-		})
+		cfg, err = config.LoadDefaultConfig(ctx,
+			config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(
+				cred.AccessKeyID,
+				cred.SecretAccessKey,
+				cred.SessionToken,
+			)),
+		)
 	} else {
-		s, err = session.NewSession()
+		cfg, err = config.LoadDefaultConfig(ctx)
 	}
 	if err != nil {
 		return nil, err
@@ -131,18 +142,13 @@ func makeSesClient(ctx context.Context, enableVault bool, vaultPath string, cros
 	// If cross-account role is specified, assume it
 	if crossAccountRole != "" {
 		log.Printf("Assuming cross-account role: %s", crossAccountRole)
-		creds := stscreds.NewCredentials(s, crossAccountRole)
-		s, err = session.NewSession(&aws.Config{
-			Credentials: creds,
-		})
-		if err != nil {
-			return nil, err
-		}
+		stsClient := sts.NewFromConfig(cfg)
+		creds := stscreds.NewAssumeRoleProvider(stsClient, crossAccountRole)
+		cfg.Credentials = creds
 		log.Printf("Successfully assumed cross-account role")
 		
 		// Verify the assumed identity
-		stsClient := sts.New(s)
-		identity, err := stsClient.GetCallerIdentity(&sts.GetCallerIdentityInput{})
+		identity, err := stsClient.GetCallerIdentity(ctx, &sts.GetCallerIdentityInput{})
 		if err != nil {
 			log.Printf("Warning: Could not verify assumed identity: %v", err)
 		} else {
@@ -150,7 +156,7 @@ func makeSesClient(ctx context.Context, enableVault bool, vaultPath string, cros
 		}
 	}
 
-	return ses.New(s), nil
+	return ses.NewFromConfig(cfg), nil
 }
 
 func main() {

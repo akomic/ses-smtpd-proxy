@@ -7,7 +7,7 @@ import (
 	"os"
 	"time"
 
-	"github.com/aws/aws-sdk-go/aws/credentials"
+	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/hashicorp/vault/api"
 	"github.com/hashicorp/vault/api/auth/approle"
 	"github.com/prometheus/client_golang/prometheus"
@@ -96,8 +96,8 @@ func renewSecret(vc *api.Client, s *api.Secret, credentialError chan<- error) er
 	return nil
 }
 
-func GetVaultSecret(ctx context.Context, path string, credentialError chan<- error) (credentials.Value, error) {
-	var r credentials.Value
+func GetVaultSecret(ctx context.Context, path string, credentialError chan<- error) (aws.Credentials, error) {
+	var r aws.Credentials
 
 	vc, err := api.NewClient(api.DefaultConfig())
 	if err != nil {
@@ -167,6 +167,11 @@ func GetVaultSecret(ctx context.Context, path string, credentialError chan<- err
 
 	r.AccessKeyID = keyId.(string)
 	r.SecretAccessKey = secretKey.(string)
+
+	// Handle session token if present
+	if sessionToken, ok := data["security_token"]; ok {
+		r.SessionToken = sessionToken.(string)
+	}
 
 	return r, renewSecret(vc, secret, credentialError)
 }
