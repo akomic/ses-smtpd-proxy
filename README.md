@@ -8,11 +8,25 @@ on the back side.
 Everything this software does is possible with a more fully-featured mail
 server like Postfix but requires setting up Postfix (which is complicated) and,
 if following best practices, rotating credentials every 90 days (which is
-annoying). Because this integrates with the AWS SDK it can be configured
+annoying). Because this integrates with the AWS SDK v2 it can be configured
 through the normal SDK configuration channels such as the instance metadata
 service which provides dynamic credentials or environment variables, in which
 case you should still manually rotate credentials but have one choke-point to
 do that.
+
+## Command Line Options
+
+The proxy supports the following command line options:
+
+- `--enable-vault` - Enable fetching AWS IAM credentials from a Vault server (default: false)
+- `--vault-path=path` - Full path to Vault credential (ex: "aws/creds/my-mail-user")
+- `--cross-account-role=arn` - ARN of cross-account role to assume for SES access
+- `--configuration-set-name=name` - SES Configuration Set name to use with SendRawEmail
+- `--enable-prometheus` - Enable Prometheus metrics server (default: false)
+- `--prometheus-bind=addr` - Address/port for Prometheus server (default: ":2501")
+- `--enable-health-check` - Enable health check server (default: false)
+- `--health-check-bind=addr` - Address/port for health check server (default: ":3000")
+- `--version` - Show program version
 
 ## Hashicorp Vault Integration
 The server supports using Hashicorp Vault to retrieve an AWS IAM user
@@ -44,14 +58,25 @@ VAULT_APPROLE_SECRET_ID="..." \
 ```
 
 ## Prometheus Integration
-By default the server will log some Prometheus metrics for messages
-sent and errors. The Prometheus metrics will be served on ``:2501``
-at the path ``/metrics`` by default. The bind address and port can be
-customized by passing ``--prometheus-bind=bind-string`` in the format
+The server can optionally serve Prometheus metrics for messages sent and errors.
+Prometheus metrics are **disabled by default** and must be explicitly enabled
+with the `--enable-prometheus` flag. When enabled, metrics will be served on 
+`:2501` at the path `/metrics` by default. The bind address and port can be
+customized by passing `--prometheus-bind=bind-string` in the format
 expected by Go's http.Server.
 
-Prometheus metric serving (though not metric aggregation) can be
-disabled by passing ``--disable-prometheus`` on the command line.
+To enable Prometheus metrics:
+
+```
+./ses-smtpd-proxy --enable-prometheus
+```
+
+Available metrics:
+- `smtpd_email_send_success_total` - Total number of successfully sent emails
+- `smtpd_email_send_fail_total` - Total number of failed emails (with error type labels)
+- `smtpd_ses_error_total` - Total number of SES-specific errors
+- `smtpd_credential_renewal_success_total` - Vault credential renewal successes (if using Vault)
+- `smtpd_credential_renewal_error_total` - Vault credential renewal errors (if using Vault)
 
 ## Health Check Integration
 
@@ -79,6 +104,18 @@ To enable cross-account role assumption, use the `--cross-account-role` flag:
 The cross-account role must have SES permissions and trust the role used by
 the proxy (e.g., IRSA role in EKS).
 
+## SES Configuration Sets
+
+The proxy supports using SES Configuration Sets for tracking and analytics.
+Specify a configuration set with the `--configuration-set-name` flag:
+
+```
+./ses-smtpd-proxy --configuration-set-name=my-config-set
+```
+
+When a configuration set is specified, it will be included in all SES API calls
+and logged in the message send logs for tracking purposes.
+
 ## Usage
 By default the command takes no arguments and will listen on port 2500 on all
 interfaces. The listen interfaces and port can be specified as the only
@@ -89,7 +126,13 @@ argument separated with a colon like so:
 ```
 
 If not using the Vault integration noted above, it is expected that your
-environment is configured in some way that is supported by the AWS SDK.
+environment is configured in some way that is supported by the AWS SDK v2.
+
+## SMTP Library
+
+This proxy uses the [go-smtp](https://github.com/emersion/go-smtp) library
+for robust SMTP command parsing and RFC compliance, including proper handling
+of email addresses with `<>` brackets and other SMTP protocol features.
 
 ## Security Warning
 This server speaks plain unauthenticated SMTP (no TLS) so it's not suitable for
@@ -108,6 +151,21 @@ in the make command like so:
 ```
 make DOCKER_REGISTRY=reg.example.com DOCKER_IMAGE_NAME=ses-proxy DOCKER_TAG=foo docker
 ```
+
+## Automated Builds
+
+The project includes GitHub Actions workflow that automatically builds and pushes
+Docker images to Docker Hub when tags are pushed. Images are built for the
+`linux/amd64` platform.
+
+## Dependencies
+
+This project uses:
+- AWS SDK for Go v2 for SES integration
+- [go-smtp](https://github.com/emersion/go-smtp) for SMTP server implementation
+- Hashicorp Vault API for credential management
+- Prometheus client for metrics
+
 ## Contributing
 If you would like to contribute please visit the project's GitHub page and open
 a pull request with your changes. To have the best experience contributing,
@@ -117,7 +175,7 @@ please:
 * Update the readme, if necessary
 * Follow the coding style of the current code-base
 * Ensure that your code is formatted by gofmt
-* Validate that your changes work with Go 1.21+
+* Validate that your changes work with Go 1.23+
 
 All code is reviewed before acceptance and changes may be requested to better
 follow the conventions of the existing API.
