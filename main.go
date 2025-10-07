@@ -1,17 +1,16 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
 
-	"code.crute.us/mcrute/ses-smtpd-proxy/smtpd"
 	"code.crute.us/mcrute/ses-smtpd-proxy/vault"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
@@ -20,6 +19,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/ses"
 	"github.com/aws/aws-sdk-go-v2/service/ses/types"
 	"github.com/aws/aws-sdk-go-v2/service/sts"
+	"github.com/emersion/go-smtp"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -50,69 +50,121 @@ var (
 	})
 )
 
-type Envelope struct {
+// Backend implements smtp.Backend
+type Backend struct {
+	sesClient         *ses.Client
+	configSetName     *string
+}
+
+// NewSession implements smtp.Backend
+func (b *Backend) NewSession(c *smtp.Conn) (smtp.Session, error) {
+	return &Session{
+		backend: b,
+		conn:    c,
+	}, nil
+}
+
+// Session implements smtp.Session
+type Session struct {
+	backend       *Backend
+	conn          *smtp.Conn
 	from          string
-	client        *ses.Client
-	configSetName *string
-	rcpts         []*string
-	b             bytes.Buffer
+	recipients    []string
+	data          []byte
 }
 
-func (e *Envelope) AddRecipient(rcpt smtpd.MailAddress) error {
-	email := rcpt.Email()
-	e.rcpts = append(e.rcpts, &email)
+// AuthPlain implements smtp.Session (no-op for unauthenticated server)
+func (s *Session) AuthPlain(username, password string) error {
 	return nil
 }
 
-func (e *Envelope) BeginData() error {
-	if len(e.rcpts) == 0 {
+// Mail implements smtp.Session
+func (s *Session) Mail(from string, opts *smtp.MailOptions) error {
+	s.from = from
+	return nil
+}
+
+// Rcpt implements smtp.Session
+func (s *Session) Rcpt(to string, opts *smtp.RcptOptions) error {
+	s.recipients = append(s.recipients, to)
+	return nil
+}
+
+// Data implements smtp.Session
+func (s *Session) Data(r io.Reader) error {
+	if len(s.recipients) == 0 {
 		emailError.With(prometheus.Labels{"type": "no valid recipients"}).Inc()
-		return smtpd.SMTPError("554 5.5.1 Error: no valid recipients")
+		return &smtp.SMTPError{
+			Code:         554,
+			EnhancedCode: smtp.EnhancedCode{5, 5, 1},
+			Message:      "Error: no valid recipients",
+		}
 	}
-	return nil
-}
 
-func (e *Envelope) Write(line []byte) error {
-	e.b.Write(line)
-	if e.b.Len() > SesSizeLimit { // SES limitation
+	// Read message data with size limit
+	data, err := io.ReadAll(io.LimitReader(r, SesSizeLimit+1))
+	if err != nil {
+		emailError.With(prometheus.Labels{"type": "read error"}).Inc()
+		return &smtp.SMTPError{
+			Code:         451,
+			EnhancedCode: smtp.EnhancedCode{4, 5, 1},
+			Message:      "Temporary server error reading message",
+		}
+	}
+
+	if len(data) > SesSizeLimit {
 		emailError.With(prometheus.Labels{"type": "minimum message size exceed"}).Inc()
-		log.Printf("message size %d exceeds SES limit of %d", e.b.Len(), SesSizeLimit)
-		return smtpd.SMTPError("554 5.5.1 Error: maximum message size exceeded")
-	}
-	return nil
-}
-
-func (e *Envelope) logMessageSend() {
-	dr := make([]string, len(e.rcpts))
-	for i := range e.rcpts {
-		dr[i] = *e.rcpts[i]
-	}
-	log.Printf("sending message from %+v to %+v", e.from, dr)
-	emailSent.Inc()
-}
-
-func (e *Envelope) Close() error {
-	// Convert []*string to []string for SDK v2
-	destinations := make([]string, len(e.rcpts))
-	for i, rcpt := range e.rcpts {
-		destinations[i] = *rcpt
+		log.Printf("message size %d exceeds SES limit of %d", len(data), SesSizeLimit)
+		return &smtp.SMTPError{
+			Code:         554,
+			EnhancedCode: smtp.EnhancedCode{5, 5, 1},
+			Message:      "Error: maximum message size exceeded",
+		}
 	}
 
-	r := &ses.SendRawEmailInput{
-		ConfigurationSetName: e.configSetName,
-		Source:               &e.from,
-		Destinations:         destinations,
-		RawMessage:           &types.RawMessage{Data: e.b.Bytes()},
+	s.data = data
+
+	// Send via SES
+	input := &ses.SendRawEmailInput{
+		ConfigurationSetName: s.backend.configSetName,
+		Source:               &s.from,
+		Destinations:         s.recipients,
+		RawMessage:           &types.RawMessage{Data: s.data},
 	}
-	_, err := e.client.SendRawEmail(context.TODO(), r)
+
+	_, err = s.backend.sesClient.SendRawEmail(context.TODO(), input)
 	if err != nil {
 		log.Printf("ERROR: ses: %v", err)
 		emailError.With(prometheus.Labels{"type": "ses error"}).Inc()
 		sesError.Inc()
-		return smtpd.SMTPError("451 4.5.1 Temporary server error. Please try again later")
+		return &smtp.SMTPError{
+			Code:         451,
+			EnhancedCode: smtp.EnhancedCode{4, 5, 1},
+			Message:      "Temporary server error. Please try again later",
+		}
 	}
-	e.logMessageSend()
-	return err
+
+	// Log successful send
+	configSetInfo := "no config set"
+	if s.backend.configSetName != nil {
+		configSetInfo = fmt.Sprintf("config set: %s", *s.backend.configSetName)
+	}
+	log.Printf("sending message from %s to %v (%s)", s.from, s.recipients, configSetInfo)
+	emailSent.Inc()
+
+	return nil
+}
+
+// Reset implements smtp.Session
+func (s *Session) Reset() {
+	s.from = ""
+	s.recipients = nil
+	s.data = nil
+}
+
+// Logout implements smtp.Session
+func (s *Session) Logout() error {
+	return nil
 }
 
 func makeSesClient(ctx context.Context, enableVault bool, vaultPath string, crossAccountRole string, credentialError chan<- error) (*ses.Client, error) {
@@ -160,12 +212,10 @@ func makeSesClient(ctx context.Context, enableVault bool, vaultPath string, cros
 }
 
 func main() {
-	var err error
-
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer cancel()
 
-	disablePrometheus := flag.Bool("disable-prometheus", false, "Disables prometheus metrics server")
+	enablePrometheus := flag.Bool("enable-prometheus", false, "Enable prometheus metrics server")
 	prometheusBind := flag.String("prometheus-bind", ":2501", "Address/port on which to bind Prometheus server")
 	enableVault := flag.Bool("enable-vault", false, "Enable fetching AWS IAM credentials from a Vault server")
 	vaultPath := flag.String("vault-path", "", "Full path to Vault credential (ex: \"aws/creds/my-mail-user\")")
@@ -205,27 +255,27 @@ func main() {
 		log.Fatalf("usage: %s [listen_host:port]", os.Args[0])
 	}
 
-	if !*disablePrometheus {
+	if *enablePrometheus {
 		sm := http.NewServeMux()
 		ps := &http.Server{Addr: *prometheusBind, Handler: sm}
 		sm.Handle("/metrics", promhttp.Handler())
 		go ps.ListenAndServe()
 	}
 
-	if *configurationSetName == "" {
-		configurationSetName = nil
+	var configSetPtr *string
+	if *configurationSetName != "" {
+		configSetPtr = configurationSetName
 	}
 
-	s := &smtpd.Server{
-		Addr: addr,
-		OnNewMail: func(c smtpd.Connection, from smtpd.MailAddress) (smtpd.Envelope, error) {
-			return &Envelope{
-				from:          from.Email(),
-				client:        sesClient,
-				configSetName: configurationSetName,
-			}, nil
-		},
+	backend := &Backend{
+		sesClient:     sesClient,
+		configSetName: configSetPtr,
 	}
+
+	s := smtp.NewServer(backend)
+	s.Addr = addr
+	s.Domain = "localhost"
+	s.AllowInsecureAuth = true // Allow plain auth over non-TLS (as per original design)
 
 	go func() {
 		log.Printf("ListenAndServe on %s", addr)
@@ -237,6 +287,7 @@ func main() {
 	select {
 	case <-ctx.Done():
 		log.Printf("SIGTERM/SIGINT received, shutting down")
+		s.Close()
 		os.Exit(0)
 	case err := <-credentialError:
 		log.Fatalf("Error renewing credential: %s", err)
