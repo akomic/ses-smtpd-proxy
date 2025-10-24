@@ -240,6 +240,7 @@ func main() {
 			w.Write([]byte("{\"name\": \"ses-smtp-proxy\", \"status\": \"ok\", \"version\": \"" + version + "\"}"))
 		}))
 		go ps.ListenAndServe()
+		log.Printf("Health check server listening on %s", *healthCheckBind)
 	}
 
 	credentialError := make(chan error, 2)
